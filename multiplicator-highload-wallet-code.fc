@@ -1,0 +1,106 @@
+;; This code is based on highload-wallet-code.fc with one difference: you can specify how 
+;; many times you need to repeat all the transactions
+
+;; Heavy-duty wallet for mass transfers (e.g., for cryptocurrency exchanges)
+;; accepts orders for up to 254 internal messages (transfers) in one external message
+
+() send_all_transactions(cell dict, int repeats_left, int stored_seqno) impure {
+  int n_sent_tx = 0;
+  int one_loop_txs = 1;
+
+  while((repeats_left > 0) & ((n_sent_tx + one_loop_txs) < 250) & (one_loop_txs > 0)) {
+    int i = -1;
+    one_loop_txs = 0;
+    do {
+      (i, var cs, var f) = dict.idict_get_next?(16, i);
+      if (f) {
+        var mode = cs~load_uint(8);
+        send_raw_message(cs~load_ref(), mode);
+        one_loop_txs += 1;
+      }
+    } until (~ f);
+    repeats_left -= 1;
+    n_sent_tx += one_loop_txs;
+  }
+
+  if((repeats_left > 0) & (n_sent_tx > 0)) {
+    ;; create additional internal message
+    send_raw_message(begin_cell()
+    .store_uint(0x10, 6)
+    .store_slice(my_address())
+    .store_grams(500000000)         ;; 0.5 Gram (sending to myself, so just to ensure we have enough funds to continue)
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_uint(0xDEADBEEF, 32)
+    .store_uint(stored_seqno, 32)
+    .store_uint(repeats_left, 16)
+    .end_cell(), 3); ;; mode for SENDRAWMSG: +1 - sender pays fees, +2 - ignore errors
+  }
+}
+
+() recv_internal(int msg_value, cell in_msg_cell, slice in_msg) impure {
+  slice cs = in_msg_cell.begin_parse();
+  int flags = cs~load_uint(4);
+  if (flags & 1) { 
+    return ();  ;; bounced messages
+  }
+  slice s_addr = cs~load_msg_addr();
+  int op = in_msg~load_uint(32);
+  ifnot (op) { 
+    return ();   ;; simple transfer with comment
+  }
+
+  if(op == 0xDEADBEEF) {
+    var (s_addr_wc, s_addr_addr) = s_addr.parse_std_addr();
+    var (my_wc, my_addr) = my_address().parse_std_addr();
+    throw_unless(101, s_addr_addr == my_addr);
+
+    int expected_seqno = in_msg~load_uint(32);
+    int repeats_left = in_msg~load_uint(16);
+
+    var ds = get_data().begin_parse();
+    var (stored_seqno, _, _, dict) = (ds~load_uint(32), ds~load_uint(32), ds~load_uint(256), ds~load_dict());
+    throw_unless(133, expected_seqno == stored_seqno);
+
+    accept_message();
+    send_all_transactions(dict, repeats_left, stored_seqno);
+  }
+
+  ;; do nothing for internal messages
+}
+
+() recv_external(slice in_msg) impure {
+  var signature = in_msg~load_bits(512);
+  var cs = in_msg;
+  var (subwallet_id, valid_until, msg_seqno) = (cs~load_uint(32), cs~load_uint(32), cs~load_uint(32));
+  throw_if(35, valid_until <= now());
+  var ds = get_data().begin_parse();
+  var (stored_seqno, stored_subwallet, public_key, _) = (ds~load_uint(32), ds~load_uint(32), ds~load_uint(256), ds~load_dict());
+  ds.end_parse();
+  throw_unless(33, msg_seqno == stored_seqno);
+  throw_unless(34, subwallet_id == stored_subwallet);
+  throw_unless(35, check_signature(slice_hash(in_msg), signature, public_key));
+  var dict = cs~load_dict();
+  var repeat_send = (cs.slice_bits() >= 16) ? cs~load_uint(16) : 1;
+  ;cs.end_parse();
+  accept_message();
+  stored_seqno += 1;
+  send_all_transactions(dict, repeat_send, stored_seqno);
+  set_data(begin_cell()
+    .store_uint(stored_seqno, 32)
+    .store_uint(stored_subwallet, 32)
+    .store_uint(public_key, 256)
+    .store_dict(dict)
+    .end_cell());
+}
+
+;; Get methods
+
+int seqno() method_id {
+  return get_data().begin_parse().preload_uint(32);
+}
+
+int get_public_key() method_id {
+  var cs = get_data().begin_parse();
+  cs~load_uint(64);
+  return cs.preload_uint(256);
+}
